@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::fs::write;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -7,12 +8,13 @@ use std::sync::{Arc, Mutex};
 
 use libs::csv::Reader;
 use libs::reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
-use libs::reqwest::{blocking::Client, header};
+use libs::reqwest::{blocking::Client, header, blocking::Response};
 use libs::tera::{
     from_value, to_value, Error, Error as TeraError, Function as TeraFn, Map, Result, Value,
 };
 use libs::url::Url;
-use libs::{nom_bibtex, serde_json, serde_yaml, toml};
+use libs::{nom_bibtex, serde_json, serde_json::json, serde_yaml, toml};
+use libs::bytes::Bytes;
 use utils::de::fix_toml_dates;
 use utils::fs::{get_file_time, read_file};
 
@@ -20,6 +22,8 @@ use crate::global_fns::helpers::search_for_file;
 
 static GET_DATA_ARGUMENT_ERROR_MESSAGE: &str =
     "`load_data`: requires EITHER a `path`, `url`, or `literal` argument";
+    
+static DOWNLOAD_SUBDIR: &str = "remote_data";
 
 #[derive(Debug, PartialEq, Clone, Copy, Hash)]
 enum Method {
@@ -48,6 +52,20 @@ enum OutputFormat {
     Plain,
     Xml,
     Yaml,
+    Jpeg,
+    File,
+}
+
+enum OutputData {
+    Toml(String),
+    Json(String),
+    Csv(String),
+    Bibtex(String),
+    Plain(String),
+    Xml(String),
+    Yaml(String),
+    Jpeg(Bytes),
+    File(Bytes),
 }
 
 impl FromStr for OutputFormat {
@@ -62,6 +80,8 @@ impl FromStr for OutputFormat {
             "xml" => Ok(OutputFormat::Xml),
             "plain" => Ok(OutputFormat::Plain),
             "yaml" | "yml" => Ok(OutputFormat::Yaml),
+            "jpg" | "jpeg" => Ok(OutputFormat::Jpeg),
+            "file" => Ok(OutputFormat::File),
             format => Err(format!("Unknown output format {}", format).into()),
         }
     }
@@ -77,7 +97,52 @@ impl OutputFormat {
             OutputFormat::Xml => "text/xml",
             OutputFormat::Plain => "text/plain",
             OutputFormat::Yaml => "application/x-yaml",
+            OutputFormat::Jpeg => "image/jpeg",
+            OutputFormat::File => "*/*",
         })
+    }
+    
+    /// True if the requested output format is a text_based format.
+    fn is_text(&self) -> bool {
+        match self {
+            OutputFormat::Json => true,
+            OutputFormat::Csv => true,
+            OutputFormat::Toml => true,
+            OutputFormat::Bibtex => true,
+            OutputFormat::Xml => true,
+            OutputFormat::Plain => true,
+            OutputFormat::Yaml => true,
+            OutputFormat::Jpeg => false,
+            OutputFormat::File => false,
+        }
+    }
+    
+    fn data_from_string(&self, data: String) -> OutputData {
+        match self {
+            OutputFormat::Json => OutputData::Json(data),
+            OutputFormat::Csv => OutputData::Csv(data),
+            OutputFormat::Toml => OutputData::Toml(data),
+            OutputFormat::Bibtex => OutputData::Bibtex(data),
+            OutputFormat::Xml => OutputData::Xml(data),
+            OutputFormat::Plain => OutputData::Plain(data),
+            OutputFormat::Yaml => OutputData::Yaml(data),
+            OutputFormat::Jpeg => OutputData::Jpeg(data.into()),
+            OutputFormat::File => OutputData::File(data.into()),
+        }        
+    }
+
+    fn data_from_bytes(&self, data: Bytes) -> OutputData {
+        match self {
+            OutputFormat::Json => OutputData::Json(String::from_utf8_lossy(&data).to_string()),
+            OutputFormat::Csv => OutputData::Csv(String::from_utf8_lossy(&data).to_string()),
+            OutputFormat::Toml => OutputData::Toml(String::from_utf8_lossy(&data).to_string()),
+            OutputFormat::Bibtex => OutputData::Bibtex(String::from_utf8_lossy(&data).to_string()),
+            OutputFormat::Xml => OutputData::Xml(String::from_utf8_lossy(&data).to_string()),
+            OutputFormat::Plain => OutputData::Plain(String::from_utf8_lossy(&data).to_string()),
+            OutputFormat::Yaml => OutputData::Yaml(String::from_utf8_lossy(&data).to_string()),
+            OutputFormat::Jpeg => OutputData::Jpeg(data),
+            OutputFormat::File => OutputData::File(data),
+        }        
     }
 }
 
@@ -231,6 +296,56 @@ impl LoadData {
         let result_cache = Arc::new(Mutex::new(HashMap::new()));
         Self { base_path, client, result_cache, theme, output_path }
     }
+
+    fn response_from_url(&self, url: &Url, method: &Method, headers: Option<Vec<String>>, file_format: &OutputFormat,
+    post_content_type: &Option<String>, post_body_arg: Option<String>) -> Result<Response> {
+        let response_client = self.client.lock().expect("response client lock");
+        let req = match method {
+            Method::Get => response_client
+                .get(url.as_str())
+                .headers(add_headers_from_args(headers)?)
+                .header(header::ACCEPT, file_format.as_accept_header()),
+            Method::Post => {
+                let mut resp = response_client
+                    .post(url.as_str())
+                    .headers(add_headers_from_args(headers)?)
+                    .header(header::ACCEPT, file_format.as_accept_header());
+                if let Some(content_type) = post_content_type {
+                    match HeaderValue::from_str(&content_type) {
+                        Ok(c) => {
+                            resp = resp.header(CONTENT_TYPE, c);
+                        }
+                        Err(_) => {
+                            return Err(format!(
+                                "`load_data`: {} is an illegal content type",
+                                &content_type
+                            )
+                            .into());
+                        }
+                    }
+                }
+                if let Some(body) = post_body_arg {
+                    resp = resp.body(body);
+                }
+                resp
+            }
+        };
+
+        Ok(match req.send().and_then(|res| res.error_for_status()) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                Err(match e.status() {
+                    Some(status) => {
+                        format!("`load_data`: Failed to request {}: {}", url, status)
+                    }
+                    None => format!(
+                        "`load_data`: Could not get response status for url: {}",
+                        url
+                    ),
+                })
+            }
+        }?)
+    }
 }
 
 impl TeraFn for LoadData {
@@ -326,73 +441,48 @@ impl TeraFn for LoadData {
 
         let data = match data_source {
             DataSource::Path(path) => read_file(&path)
+                .map(|data| file_format.data_from_string(data))
                 .map_err(|e| format!("`load_data`: error reading file {:?}: {}", path, e)),
             DataSource::Url(url) => {
-                let response_client = self.client.lock().expect("response client lock");
-                let req = match method {
-                    Method::Get => response_client
-                        .get(url.as_str())
-                        .headers(add_headers_from_args(headers)?)
-                        .header(header::ACCEPT, file_format.as_accept_header()),
-                    Method::Post => {
-                        let mut resp = response_client
-                            .post(url.as_str())
-                            .headers(add_headers_from_args(headers)?)
-                            .header(header::ACCEPT, file_format.as_accept_header());
-                        if let Some(content_type) = post_content_type {
-                            match HeaderValue::from_str(&content_type) {
-                                Ok(c) => {
-                                    resp = resp.header(CONTENT_TYPE, c);
-                                }
-                                Err(_) => {
-                                    return Err(format!(
-                                        "`load_data`: {} is an illegal content type",
-                                        &content_type
-                                    )
-                                    .into());
-                                }
-                            }
+                let response = self.response_from_url(&url, &method, headers, &file_format, &post_content_type, post_body_arg);
+                println!("HERE {}", url);
+                match response {
+                    Ok(r) => {
+                        if file_format.is_text() {
+                            r.text()
+                                .map(|data| file_format.data_from_string(data))
+                        } else {
+                            r.bytes()
+                                .map(|data| file_format.data_from_bytes(data))
                         }
-                        if let Some(body) = post_body_arg {
-                            resp = resp.body(body);
-                        }
-                        resp
-                    }
-                };
-
-                match req.send().and_then(|res| res.error_for_status()) {
-                    Ok(r) => r.text().map_err(|e| {
-                        format!("`load_data`: Failed to parse response from {}: {:?}", url, e)
-                    }),
+                        .map_err(|e| {
+                            format!("`load_data`: Failed to parse response from {}: {:?}", url, e)
+                        })
+                    },
                     Err(e) => {
                         if !required {
                             // HTTP error is discarded (because required=false) and
                             // Null value is returned to the template
                             return Ok(Value::Null);
                         }
-                        Err(match e.status() {
-                            Some(status) => {
-                                format!("`load_data`: Failed to request {}: {}", url, status)
-                            }
-                            None => format!(
-                                "`load_data`: Could not get response status for url: {}",
-                                url
-                            ),
-                        })
+                        return Err(e)
                     }
                 }
             }
-            DataSource::Literal(string_literal) => Ok(string_literal),
+            DataSource::Literal(string_literal) => Ok(string_literal)
+                .map(|data| file_format.data_from_string(data)),
         }?;
-
-        let result_value: Result<Value> = match file_format {
-            OutputFormat::Toml => load_toml(data),
-            OutputFormat::Csv => load_csv(data),
-            OutputFormat::Json => load_json(data),
-            OutputFormat::Bibtex => load_bibtex(data),
-            OutputFormat::Xml => load_xml(data),
-            OutputFormat::Yaml => load_yaml(data),
-            OutputFormat::Plain => to_value(data).map_err(|e| e.into()),
+        
+        let result_value = match data {
+            OutputData::Toml(data) => load_toml(data),
+            OutputData::Csv(data) => load_csv(data),
+            OutputData::Json(data) => load_json(data),
+            OutputData::Bibtex(data) => load_bibtex(data),
+            OutputData::Xml(data) => load_xml(data),
+            OutputData::Yaml(data) => load_yaml(data),
+            OutputData::Plain(data) => to_value(data).map_err(|e| e.into()),
+            OutputData::Jpeg(data) => write_to_file(&self.base_path, &format!("{}.{}", cache_key.to_string(), "jpeg"), &data),
+            OutputData::File(data) => write_to_file(&self.base_path, &cache_key.to_string(), &data),
         };
 
         if let Ok(data_result) = &result_value {
@@ -401,6 +491,14 @@ impl TeraFn for LoadData {
 
         result_value
     }
+}
+
+fn write_to_file(base_path: &PathBuf, filename: &str, data: &[u8]) -> Result<Value> {
+    let output_dir = base_path.join("static").join(DOWNLOAD_SUBDIR);
+    write(output_dir.join(filename), data)?;
+    Ok(json!({
+        "static_path": Path::new("static").join(DOWNLOAD_SUBDIR).join(filename),
+    }))
 }
 
 /// Parse a JSON string and convert it to a Tera Value

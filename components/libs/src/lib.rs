@@ -8,6 +8,7 @@ pub use ahash;
 pub use ammonia;
 pub use atty;
 pub use base64;
+pub use bytes;
 pub use csv;
 pub use elasticlunr;
 pub use filetime;
